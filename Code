@@ -1,0 +1,637 @@
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/sctp.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <getopt.h>
+#include <time.h>
+#include <sys/select.h>
+#include <errno.h>
+
+#define SIZE_OF_MESSAGE 1000
+#define MAX_LOCAL_ADDR 10
+#define MAX_REMOTE_ADDR 10
+
+static void print_notification(void *buf){
+	struct sctp_assoc_change *sac;
+	struct sctp_paddr_change *spc;
+	struct sctp_send_failed *ssf;
+	struct sctp_remote_error *sre;
+	struct sctp_adaptation_event *sad;
+	struct sctp_authkey_event *sae;
+	union sctp_notification *snp;
+	char addrbuf[INET6_ADDRSTRLEN];
+	const char *ap;
+	struct sockaddr_in *sin;
+	struct sockaddr_in6 *sin6;
+	snp = buf;
+	switch(snp->sn_header.sn_type){
+		case SCTP_ASSOC_CHANGE:
+			sac = &snp->sn_assoc_change;
+			printf("Association change: ");
+			switch(sac->sac_state){
+				case SCTP_COMM_UP:
+					printf("Communication up (streams (in/out)=(%u/%u)).\n", sac->sac_inbound_streams, sac->sac_outbound_streams);
+					break;
+				case SCTP_COMM_LOST:
+					printf("Communication lost (error=%d).\n", sac->sac_error);
+					break;
+				case SCTP_RESTART:
+					printf("Communication restarted (streams (in/out)=(%u/%u).\n", sac->sac_inbound_streams, sac->sac_outbound_streams);
+					break;
+				case SCTP_SHUTDOWN_COMP:
+					printf("Communication completed.\n");
+					break;
+				case SCTP_CANT_STR_ASSOC:
+					printf("Communication couldn’t be started.\n");
+					break;
+				default:
+					printf("Unknown state: %d.\n", sac->sac_state);
+					break;
+			}
+			break;
+		case SCTP_PEER_ADDR_CHANGE:
+			spc = &snp->sn_paddr_change;
+			if (spc->spc_aaddr.ss_family == AF_INET){
+				sin = (struct sockaddr_in *)&spc->spc_aaddr;
+				ap = inet_ntop(AF_INET, &sin->sin_addr, addrbuf, INET6_ADDRSTRLEN);
+			} else {
+				sin6 = (struct sockaddr_in6 *)&spc->spc_aaddr;
+				ap = inet_ntop(AF_INET6, &sin6->sin6_addr, addrbuf, INET6_ADDRSTRLEN);
+			}
+			printf("Peer Address change: %s",ap);
+			switch (spc->spc_state) {
+				case SCTP_ADDR_CONFIRMED:
+					printf(" is now confirmed.\n");
+					break;
+				case SCTP_ADDR_AVAILABLE:
+					printf(" is available.\n");
+					break;
+				case SCTP_ADDR_UNREACHABLE:
+					printf(" is not available (error=%d).\n", spc->spc_error);
+					break;
+				case SCTP_ADDR_REMOVED:
+					printf(" was removed.\n");
+					break;
+				case SCTP_ADDR_ADDED:
+					printf(" was added.\n");
+					break;
+				case SCTP_ADDR_MADE_PRIM:
+					printf(" is primary.\n");
+					break;
+				default:
+					printf(" unknown state (%d).\n", spc->spc_state);
+					break;
+			}
+			break;
+		case SCTP_REMOTE_ERROR:
+			sre = &snp->sn_remote_error;
+			printf("Remote_error: err=%hu len=%hu\n", ntohs(sre->sre_error), ntohs(sre->sre_length));
+			break;
+		case SCTP_SEND_FAILED:
+			ssf = &snp->sn_send_failed;
+			printf("sendfailed: len=%u err=%d\n", ssf->ssf_length, ssf->ssf_error);
+			break;
+		case SCTP_SHUTDOWN_EVENT:
+			printf("Shutdown received.\n");
+			break;
+		case SCTP_ADAPTATION_INDICATION:
+			sad = &snp->sn_adaptation_event;
+			printf("Adaptation indication 0x%06x received.\n", sad->sai_adaptation_ind);
+			break;
+		case SCTP_PARTIAL_DELIVERY_EVENT:
+			printf("Partial Delivery.\n");
+			break;
+		case SCTP_AUTHENTICATION_EVENT:
+#if defined(__linux__)
+			sae = &snp->sn_authkey_event;
+#endif
+#if defined(__FreeBSD__)
+			sae = &snp->sn_auth_event;
+#endif
+			printf("Authentication event: ");
+			switch (sae->auth_indication) {
+				case SCTP_AUTH_NEW_KEY:
+					printf("new active key for keynumber %u.\n", sae->auth_keynumber);
+					break;
+				case SCTP_AUTH_NO_AUTH:
+					printf("peer does not support SCTP authentication.\n");
+					break;
+				case SCTP_AUTH_FREE_KEY:
+					printf("key for keynumber %u not used anymore.\n", sae->auth_keynumber);
+					break;
+				default:
+					printf("key_number: %u, indication: %u\n", sae->auth_keynumber, sae->auth_indication);
+					break;
+			}
+			break;
+		case SCTP_STREAM_RESET_EVENT:
+			printf("Stream reset event.\n");
+			break;
+		case SCTP_SENDER_DRY_EVENT:
+			printf("No more user data.\n");
+			break;
+		case SCTP_ASSOC_RESET_EVENT:
+			printf("Association reset event.\n");
+			break;
+		case SCTP_STREAM_CHANGE_EVENT:
+			printf("Stream change event.\n");
+			break;
+		case SCTP_SEND_FAILED_EVENT:
+			printf("Send failed event.\n");
+			break;
+		default:
+			printf("Unknown event of type: %u.\n", snp->sn_header.sn_type);
+			break;
+	};
+}
+char *protocol = NULL; 
+// Function to handle peer connection
+void handle_peer(int fd, const char *protocol) {
+	char buffer[SIZE_OF_MESSAGE];
+	ssize_t n;
+	size_t len=0;
+	struct iovec iov[1];
+	iov[0].iov_base = (void *)(buffer + len);
+	iov[0].iov_len = sizeof(buffer) - len;
+	int flags = 0;
+	printf("Peer Connected.\n");
+	if (protocol == NULL) {
+		printf("No protocol specified. Closing the connection.\n");
+		close(fd);
+		pthread_exit(NULL);
+	}
+	// After determining the requested protocol
+	if (strcmp(protocol, "ECHO") == 0) {
+		// Echo protocol
+		printf("ECHO protocol selected.\n");
+		while(1){
+			flags = 0;
+			n = sctp_recvv(fd, iov, 1, NULL,0,NULL,0,NULL,&flags);
+			if (n<=0){
+				break;
+			}
+			if (flags & MSG_NOTIFICATION){
+				print_notification(iov[0].iov_base);
+			}else if (flags & MSG_EOR){
+				len += n;
+				// Print received message
+				write(1, buffer, len);
+				iov[0].iov_base = buffer;
+				iov[0].iov_len = len;
+				// Echo back the message to the client
+				if (sctp_sendv(fd, iov, 1, NULL, 0, NULL, 0, 0, 0) < 0){
+					perror("Failed to Echo back the message");
+					break;
+				}
+				iov[0].iov_len = sizeof(buffer);
+				len = 0;
+			}else{
+				len += n;
+				if(len == sizeof(buffer)){
+					printf("Received message larger than buffer\n");
+					break;
+				}
+				// Adjust iov for the remaining buffer space
+				iov[0].iov_base = (void *)(buffer + len);
+				iov[0].iov_len = sizeof(buffer) - len;
+			}
+		}
+	}else if(strcmp(protocol, "DISCARD") == 0){
+		// Discard protocol
+		printf("DISCARD protocol selected.\n");
+		while(1){
+			flags = 0;
+			n = sctp_recvv(fd, iov, 1, NULL,0,NULL,0,NULL,&flags);
+			if(n > 0 && flags & MSG_NOTIFICATION){
+				print_notification(iov[0].iov_base);
+			}else{
+				if(n<=0)
+				break;
+				// Print received message
+				printf("Message Received (after shutdown):\n");
+				write(1, iov[0].iov_base, n);
+				// Discard the received message
+			}
+		}
+	}else if(strcmp(protocol, "DAYTIME") == 0){
+		// Daytime protocol
+		printf("DAYTIME protocol selected.\n");
+		time_t current_time;
+		time(&current_time);
+		//To store the length of the output
+		len = snprintf(buffer, sizeof(buffer), "%s\n", ctime(&current_time));
+		iov[0].iov_base = (void *)buffer;
+		iov[0].iov_len = len;
+		if(sctp_sendv(fd,iov,1,NULL,0,NULL,0,0,0)<0){
+			perror("Failed to send data to client");
+		}
+		// Print sent message
+		write(1, iov[0].iov_base, len);
+		// Shutdown the writing part of the socket
+		if(shutdown(fd, SHUT_WR) < 0){
+			perror("Failed to shutdown socket");
+		}
+		iov[0].iov_len = sizeof(buffer);
+		// Continue as a discard server
+		while(1){
+			flags = 0;
+			ssize_t n = sctp_recvv(fd, iov, 1, NULL,0,NULL,0,NULL, &flags);
+			if(n > 0 && flags & MSG_NOTIFICATION){
+				print_notification(iov[0].iov_base);
+			}else{
+				if(n<=0){
+					// Peer has closed the connection
+					printf("Peer disconnected.\n");
+					break;
+				}
+				// Print received message
+				printf("Message Received (after shutdown):\n");
+				write(1, iov[0].iov_base, n);
+				// Discard the received message
+			}
+		}
+	}else if(strcmp(protocol, "CHARGEN") == 0){
+		// Chargen protocol
+		printf("CHARGEN protocol selected.\n");
+		const char *chargen_chars = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+		size_t char_index = 0;
+		// Set up fd_set for select
+		fd_set read_fds, write_fds;
+		FD_ZERO(&read_fds);
+		FD_ZERO(&write_fds);
+		while(1){
+			FD_SET(fd, &read_fds);
+			FD_SET(fd, &write_fds);
+			// Use select to check if the socket is readable or writable
+			int select_chargen = select(fd + 1, &read_fds, &write_fds, NULL, NULL);
+			if(select_chargen < 0){
+				perror("select");
+				break;
+			}
+			if(FD_ISSET(fd, &read_fds)){
+				// Socket is readable, read from it
+				iov[0].iov_base = (void *)buffer;
+				iov[0].iov_len = sizeof(buffer);
+				flags = 0;
+				n = sctp_recvv(fd, iov, 1, NULL,0,NULL,0,NULL,&flags);
+				if(n > 0 && flags & MSG_NOTIFICATION){
+					print_notification(iov[0].iov_base);
+				}else{
+					if(n <= 0){
+						// Peer has closed the connection
+						printf("Peer disconnected.\n");
+						break;
+					}
+					// Print received message
+					printf("\nReceived from Peer:\n");
+					write(1, iov[0].iov_base, n);
+				}
+			}
+			if(FD_ISSET(fd, &write_fds)){
+				// Socket is writable, write to it
+				struct iovec iov[1];
+				iov[0].iov_base = (void *)&chargen_chars[char_index];
+				iov[0].iov_len = 1;
+				int sent_bytes = sctp_sendv(fd, iov, 1, NULL, 0, NULL, 0, 0, 0);
+				if(sent_bytes < 0){
+					perror("Failed to send data to Peer");
+					break;
+				}else if(sent_bytes == 0){
+					// Peer has closed the connection
+					printf("Peer disconnected.\n");
+					break;
+				}
+				// Print sent message
+				printf("\nSent to Peer: %c\n", chargen_chars[char_index]);
+				// Update char_index for the next character to be sent
+				char_index = (char_index + 1) % strlen(chargen_chars);
+			}
+		}
+	}else{
+		printf("Unknown protocol: %s\n", protocol);
+	}
+	// Close socket
+	close(fd);
+}
+int main(int argc, char *argv[]) {
+	int option;
+	int fd, new_fd;
+	uint16_t local_port = 0;
+	union sock_union {
+		struct sockaddr sa;
+		struct sockaddr_in s4;
+		struct sockaddr_in6 s6;
+	};
+	char *local_addr[MAX_LOCAL_ADDR * sizeof(struct sockaddr_in6)];
+	char *local_addr_ptr = (char *)local_addr;
+	unsigned int num_local_addr = 0;
+	struct sctp_event event;
+	uint16_t event_types[] = {SCTP_ASSOC_CHANGE,
+								SCTP_PEER_ADDR_CHANGE,
+								SCTP_REMOTE_ERROR,
+								SCTP_SEND_FAILED,
+								SCTP_SHUTDOWN_EVENT,
+								SCTP_ADAPTATION_INDICATION,
+								SCTP_PARTIAL_DELIVERY_EVENT,
+								SCTP_AUTHENTICATION_EVENT,
+								SCTP_STREAM_RESET_EVENT,
+								SCTP_SENDER_DRY_EVENT,
+								SCTP_ASSOC_RESET_EVENT,
+								SCTP_STREAM_CHANGE_EVENT,
+								SCTP_SEND_FAILED_EVENT};
+	int i;
+	const int on = 1;
+	const int off = 0;
+	int ipv4only = 0;
+	int ipv6only = 0;
+	uint32_t rto_max = 0;
+	uint32_t rto_min = 0;
+	uint32_t rto_initial = 0;
+	int incoming_streams = 1;  
+	int outgoing_streams = 1;
+	uint16_t remote_port = 0;
+	char *remote_addr[MAX_LOCAL_ADDR * sizeof(struct sockaddr_in6)];
+	char *remote_addr_ptr = (char *)remote_addr;
+	unsigned int num_remote_addr = 0;
+	while((option = getopt(argc, argv, "P:L:m:M:I:p:i:o:46")) != -1){
+		switch (option) {
+			case 'P':
+				local_port = atoi(optarg);
+				break;
+			case 'L':
+				if (num_local_addr < MAX_LOCAL_ADDR) {
+					struct sockaddr_in *s4 = (struct sockaddr_in *)local_addr_ptr;
+					struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)local_addr_ptr;
+					if (inet_pton(AF_INET6, optarg, &s6->sin6_addr)) {
+						s6->sin6_family = AF_INET6;
+#if defined(__FreeBSD__)
+						s6->sin6_len = sizeof(struct sockaddr_in6);
+#endif
+						local_addr_ptr += sizeof(struct sockaddr_in6);
+						num_local_addr++;
+					} else {
+						if (inet_pton(AF_INET, optarg, &s4->sin_addr)) {
+							s4->sin_family = AF_INET;
+#if defined(__FreeBSD__)
+							s4->sin_len = sizeof(struct sockaddr_in);
+#endif
+							local_addr_ptr += sizeof(struct sockaddr_in);
+							num_local_addr++;
+						} else {
+							printf("Invalid address\n");
+							fprintf(stderr, "%s", "Usage");
+							exit(1);
+						}
+					}
+				}
+				break;
+			case 'm':
+				rto_min = atoi(optarg);
+				break;
+			case 'M':
+				rto_max = atoi(optarg);
+				break;
+			case 'I':
+				rto_initial = atoi(optarg);
+				break;
+			case 'p':
+				protocol = optarg;
+				break;
+			case 'i':
+				incoming_streams = atoi(optarg);
+				break;
+			case 'o':
+				outgoing_streams = atoi(optarg);
+				break;
+			case '4':
+				ipv4only = 1;
+				if (ipv6only) {
+					printf("IPv6 only already\n");
+					exit(1);
+				}
+				break;
+			case '6':
+				ipv6only = 1;
+				if (ipv4only) {
+					printf("IPv4 only already\n");
+					exit(1);
+				}
+				break;
+			default:
+				fprintf(stderr, "Usage: %s -P <local_port> -L <local_address1> ... -L <local_addressN> -m <rto_min> -M <rto_max> -I <rto_initial> -p <protocol> -i <incoming_streams> -o <outgoing_streams> <remote_address1> ... <remote_addressN> <remote_port>\n", argv[0]);
+				exit(1);
+		}
+	}
+	if (num_local_addr == 0) {
+		memset((void *)local_addr, 0, sizeof(local_addr));
+		if (ipv4only) {
+			struct sockaddr_in *s4 = (struct sockaddr_in *)local_addr;
+			s4->sin_family = AF_INET;
+			s4->sin_port = htons(local_port);
+#if defined(__FreeBSD__)
+			s4->sin_len = sizeof(struct sockaddr_in);
+#endif
+			s4->sin_addr.s_addr = htonl(INADDR_ANY);
+		} else {
+			struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)local_addr;
+			s6->sin6_family = AF_INET6;
+			s6->sin6_port = htons(local_port);
+#if defined(__FreeBSD__)
+			s6->sin6_len = sizeof(struct sockaddr_in6);
+#endif
+			s6->sin6_addr = in6addr_any;
+		}
+		num_local_addr = 1;
+	}
+	local_addr_ptr = (char *)local_addr;
+	if (argc == optind) {
+		if (local_port ==0) {
+			local_port = 7;
+		}
+	}
+	for (i = 0; i < num_local_addr; i++) {
+		struct sockaddr_in *s4 = (struct sockaddr_in *)local_addr_ptr;
+		struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)local_addr_ptr;
+		if (s4->sin_family == AF_INET) {
+			s4->sin_port = htons(local_port);
+			local_addr_ptr += sizeof(struct sockaddr_in);
+			if (ipv6only) {
+				printf("Can't use IPv4 address when IPv6 only\n");
+				exit(1);
+			}
+		} else if (s6->sin6_family == AF_INET6) {
+			s6->sin6_port = htons(local_port);
+			local_addr_ptr += sizeof(struct sockaddr_in6);
+			if (ipv4only) {
+				printf("Can't use IPv6 address when IPv4 only\n");
+				exit(1);
+			}
+		}
+	}
+	// Create and configure the SCTP socket
+	fd = socket((ipv4only ? AF_INET : AF_INET6), SOCK_STREAM, IPPROTO_SCTP);
+	if (fd < 0) {
+		perror("Socket creation failed");
+		exit(1);
+	}
+	if (!ipv4only) {
+		if (ipv6only) {
+			if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const void *)&on, (socklen_t)sizeof(on)) < 0)
+				perror("ipv6only");
+		} else {
+				if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const void *)&off, (socklen_t)sizeof(off)) < 0)
+				perror("ipv6only");
+		}
+	}
+	// Set the number of streams
+	struct sctp_initmsg initmsg;
+	memset(&initmsg, 0, sizeof(initmsg));
+	initmsg.sinit_num_ostreams = outgoing_streams;
+	initmsg.sinit_max_instreams = incoming_streams;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, &initmsg, sizeof(initmsg)) < 0) {
+		perror("Failed to set SCTP INIT parameters");
+		exit(1);
+	}
+	// Set SCTP RTO parameters
+	struct sctp_rtoinfo rto_info;
+	memset(&rto_info, 0, sizeof(rto_info));
+	rto_info.srto_max = rto_max;
+	rto_info.srto_min = rto_min;
+	rto_info.srto_initial = rto_initial;
+	if (setsockopt(fd, IPPROTO_SCTP, SCTP_RTOINFO, &rto_info, sizeof(rto_info)) < 0) {
+		perror("Failed to set SCTP RTO parameters");
+		exit(1);
+	}
+	// Enable the events of interest.
+	struct sctp_event_subscribe events;
+	memset(&events, 0, sizeof(events));
+	event.se_assoc_id = SCTP_FUTURE_ASSOC;
+	event.se_on = 1;
+	for (i = 0; i < sizeof(event_types)/sizeof(uint16_t); i++) {
+		event.se_type = event_types[i];
+		if (setsockopt(fd, IPPROTO_SCTP, SCTP_EVENT, &event, sizeof(event)) < 0) {
+			perror("setsockopt");
+			exit(1);
+		}
+	}
+	// Bind to local addresses for the socket
+	if (num_local_addr > 0){  
+		if (sctp_bindx(fd, (struct sockaddr *)local_addr, num_local_addr, SCTP_BINDX_ADD_ADDR) != 0)
+			perror("Failed to bind to local addresses");
+	}
+	if (argc == optind) {
+		// SERVER code
+		// Start listening for Peer connections
+		if (listen(fd, 5) < 0) {
+			perror("Failed to listen for Peer connections");
+			exit(1);
+		}
+		printf("Server started and listening on port %d\n", local_port);
+		// Accept client connections 
+		while (1) {
+			struct sockaddr_storage client_addr;
+			socklen_t client_addr_len = sizeof(client_addr);
+			// Accept a new client connection
+			int new_fd = accept(fd, (struct sockaddr *)&client_addr, &client_addr_len);
+			if (new_fd < 0) {
+				perror("Failed to accept client connection");
+				continue;
+			}
+			// Handle Peer
+			handle_peer(new_fd, protocol);
+		}
+		sleep(1);
+		// Close socket
+		close(new_fd);
+	} else if (argc >= 2 + optind) {
+		// CLIENT CODE
+		// Parse command-line arguments for client
+		remote_port = atoi(argv[argc - 1]);
+		// Connect to Remote addresses 
+		for (; optind < argc - 1; optind++) {
+			if (num_remote_addr < MAX_REMOTE_ADDR) {
+				struct sockaddr_in *s4 = (struct sockaddr_in *)remote_addr_ptr;
+				struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)remote_addr_ptr;
+				if (inet_pton(AF_INET6, argv[optind], &s6->sin6_addr)) {
+					s6->sin6_family = AF_INET6;
+#if defined(__FreeBSD__)
+					s6->sin6_len = sizeof(struct sockaddr_in6);
+#endif
+					s6->sin6_port = htons(remote_port);
+					remote_addr_ptr += sizeof(struct sockaddr_in6);
+					if (ipv4only) {
+						printf("Can't use IPv6 address when IPv4 only\n");
+						exit(1);
+					}
+					num_remote_addr++;
+				} else {
+					if (inet_pton(AF_INET, argv[optind], &s4->sin_addr)) {
+						s4->sin_family = AF_INET;
+#if defined(__FreeBSD__)
+						s4->sin_len = sizeof(struct sockaddr_in);
+#endif
+						s4->sin_port = htons(remote_port);
+						remote_addr_ptr += sizeof(struct sockaddr_in);
+						if (ipv6only) {
+							printf("Can't use IPv4 address when IPv6 only\n");
+							exit(1);
+						}
+						num_remote_addr++;
+					} else {
+						printf("Invalid address: %s\n", argv[optind]);
+					}
+				}
+			}
+		}
+		if (sctp_connectx(fd, (struct sockaddr *)remote_addr, num_remote_addr, NULL) < 0) {
+			if (errno != EINPROGRESS) {
+				perror("sctp_connectx");
+				exit(1);
+			}
+		}
+		// Using select() to wait for the socket to become writable
+		fd_set read_fds, write_fds;
+		FD_ZERO(&read_fds);
+		FD_ZERO(&write_fds);
+		FD_SET(fd, &read_fds);
+		FD_SET(fd, &write_fds);
+		struct timeval timeout;
+		timeout.tv_sec = 2;  
+		timeout.tv_usec = 0;
+		int select_result = select(fd + 1, &read_fds, &write_fds, NULL, &timeout);
+		if (select_result < 0) {
+		perror("select");
+			exit(1);
+		} else if (select_result == 0) {
+			perror("Connection setup timeout");
+			exit(1);
+		}
+		// Check if the socket is now writable and check for errors using getsockopt()
+		int optval;
+		socklen_t optlen = sizeof(optval);
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &optval, &optlen) == -1) {
+			perror("getsockopt");
+			exit(1);
+		}
+		if (optval != 0) {
+			fprintf(stderr, "Connection setup failed with error: %s\n", strerror(optval));
+			exit(1);
+		}
+		//handle peer
+		handle_peer(fd, protocol);
+		sleep(1);
+		// Close the socket
+		close(fd);
+	} else {
+		fprintf(stderr, "Usage: %s -P <local_port> -L <local_address1> ... -L <local_addressN> -m <rto_min> -M <rto_max> -I <rto_initial> -p <protocol> -i <incoming_streams> -o <outgoing_streams> <remote_address1> ... <remote_addressN> <remote_port>\n", argv[0]);
+		exit(1);
+	}
+	return 0;
+}
