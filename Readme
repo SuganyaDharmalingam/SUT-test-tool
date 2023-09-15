@@ -1,0 +1,12 @@
+*************System under Test (SUT) application for the SCTP test tool (stt)*********************************
+
+
+This project is designing a SUT application required for the ETSI test cases. The command line tool is used to make a Linux or FreeBSD implementation a SUT for the stt test tool. 
+
+This SUT act as a counterpart for running the test using stt. 
+This tool can be used in combination with stt or with itself. Services needed such as (Echo, Discard, Daytime, Chargen) were implemented to support the stt based test cases. 
+It is used to make a Linux or FreeBSD implementation a SUT for the stt test tool. 
+
+The SUT application was written in C and uses socket API functions. 
+This tool has been executed in both the Linux and FreeBSD operating systems and the client-server communication was tested and analyzed. 
+
